@@ -27,7 +27,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 try:
                     msg = json.loads(data)
                     if msg.get("action") == "stats":
-                        client_stats[client_id] = int(msg.get("count", 0))
+                        # Serwer akceptuje statystyki TYLKO jeśli atak trwa
+                        if attack_running:
+                            client_stats[client_id] = int(msg.get("count", 0))
+                        else:
+                            client_stats[client_id] = 0
                 except:
                     pass
     except WebSocketDisconnect:
@@ -98,9 +102,12 @@ async def stop_all():
     attack_started = 0.0
     if stop_task and not stop_task.done():
         stop_task.cancel()
+        
     payload = json.dumps({"action": "stop"})
     await asyncio.gather(*[ws.send_text(payload) for ws in clients.values()])
-    # Reset wszystkich statystyk po STOP
+    
+    # Twarde zerowanie po STOP
     for k in client_stats:
         client_stats[k] = 0
+        
     return {"status": "stopped", "clients_count": len(clients)}
